@@ -2,6 +2,7 @@
 html, body { margin: 0; height: 100%; background: #0d0b14; color: #eee; font: 15px/1.4 system-ui, "Segoe UI", sans-serif; overflow: hidden; }
 canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
 body.playing canvas { cursor: none; }
+body.playing.hw canvas { cursor: crosshair; }
 
 .overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(8, 6, 14, .82); overflow: auto; padding: 16px; }
 .overlay.hidden { display: none; }
@@ -38,3 +39,12 @@ kbd { background: #2a2450; border: 1px solid #4a4180; border-radius: 4px; paddin
 .rank { font-size: 72px; font-weight: 800; color: #ffd27a; line-height: 1.1; }
 .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; text-align: left; margin: 10px 0; }
 .stats span:nth-child(even) { text-align: right; font-variant-numeric: tabular-nums; }
+
+.set { display: flex; gap: 6px; }
+.set button:first-child { flex: 1; text-align: left; background: #2a2450; color: #eee; font-weight: normal; }
+.set.sel button:first-child { outline: 2px solid #ff66aa; }
+.set b { color: #ff66aa; }
+.set em { float: right; color: #9a92c0; font-style: normal; }
+.set .del { background: #3a2a4a; color: #ccc; padding: 6px 10px; }
+.search { width: 100%; margin: 8px 0; padding: 8px 10px; border-radius: 8px; border: 1px solid #3a3260; background: #120f22; color: #eee; font: inherit; }
+code { background: #2a2450; padding: 0 4px; border-radius: 4px; }

@@ -15,8 +15,13 @@
 
     <label id="drop" class="drop">
       <input id="files" type="file" multiple accept=".osz,.osu,audio/*,image/*,.mp3,.ogg,.wav">
-      <b>.osz</b> hierher ziehen oder klicken – oder <b>.osu</b> + Audiodatei zusammen auswählen.
+      <b>.osz</b> hierher ziehen oder klicken – oder <b>.osu</b> + Musik (+ Bild) zusammen auswählen.<br>
+      <small>Importierte Beatmaps bleiben in der Bibliothek (nur lokal im Browser gespeichert).</small>
     </label>
+    <div class="row">
+      <button id="pickDir">Ordner importieren (z. B. <code>osu!/Songs</code>)</button>
+      <input id="dir" type="file" webkitdirectory multiple hidden>
+    </div>
 
     <div class="row">
       <button id="demoStd">Demo: Standard</button>
@@ -24,6 +29,8 @@
     </div>
 
     <div id="status" class="status"></div>
+    <input id="search" class="search" type="search" placeholder="Bibliothek durchsuchen …">
+    <div id="library" class="diffs"></div>
     <div id="diffs" class="diffs"></div>
 
     <details open>
@@ -36,6 +43,8 @@
         </label>
         <label><input id="noFail" type="checkbox" checked> No Fail</label>
         <label><input id="autoplay" type="checkbox"> Autoplay (Test)</label>
+        <label title="Fade-Outs, Snaking, Cursor-Trail, Treffer-Popups. Aus = minimale Latenz"><input id="fx" type="checkbox"> Effekte</label>
+        <label title="Echter System-Cursor: geringste Latenz (wird nicht im Canvas gezeichnet)"><input id="hw" type="checkbox"> Hardware-Cursor</label>
         <label><input id="fps" type="checkbox"> FPS anzeigen</label>
         <label><input id="bg" type="checkbox"> Hintergrundbild</label>
         <label title="Raw Input: Cursor wird relativ und ohne Windows-Beschleunigung bewegt (Klick ins Spiel)"><input id="lock" type="checkbox"> Maus sperren (Raw)</label>
@@ -75,6 +84,7 @@
 
 <script src="parser.js"></script>
 <script src="zip.js"></script>
+<script src="library.js"></script>
 <script src="demo.js"></script>
 <script src="game.js"></script>
 </body>

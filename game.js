@@ -12,9 +12,11 @@
   const DEFAULT_COLOURS = ['#ff9bd0', '#7fd1ff', '#a5ff8c', '#ffd27a'];
 
   /* ---------------- settings ---------------- */
-  const settings = { vol: 60, offset: 0, scale: 1, noFail: true, autoplay: false, fps: true, bg: true, lock: false };
+  const settings = { vol: 60, offset: 0, scale: 1, noFail: true, autoplay: false, fps: false, bg: false, lock: false, fx: false, hw: true };
   try { Object.assign(settings, JSON.parse(localStorage.getItem('ozu-settings') || '{}')); } catch (e) { /* ignore */ }
+  function setCursorClass() { document.body.classList.toggle('hw', settings.hw); }
   function saveSettings() { try { localStorage.setItem('ozu-settings', JSON.stringify(settings)); } catch (e) { /* ignore */ } }
+  setCursorClass();
   $('vol').value = settings.vol; $('offset').value = settings.offset; $('scale').value = String(settings.scale);
   $('noFail').checked = settings.noFail; $('autoplay').checked = settings.autoplay;
   $('vol').oninput = e => { settings.vol = +e.target.value; applyVolume(); saveSettings(); };
@@ -22,7 +24,7 @@
   $('scale').onchange = e => { settings.scale = +e.target.value; resize(); saveSettings(); };
   $('noFail').onchange = e => { settings.noFail = e.target.checked; saveSettings(); };
   $('autoplay').onchange = e => { settings.autoplay = e.target.checked; saveSettings(); };
-  for (const k of ['fps', 'bg', 'lock']) { $(k).checked = settings[k]; $(k).onchange = e => { settings[k] = e.target.checked; saveSettings(); }; }
+  for (const k of ['fps', 'bg', 'lock', 'fx', 'hw']) { $(k).checked = settings[k]; $(k).onchange = e => { settings[k] = e.target.checked; saveSettings(); if (k === 'hw') setCursorClass(); if (G) for (const it of G.items) it.bodyC = undefined; }; }
 
   /* ---------------- audio ---------------- */
   let ac = null, gain = null, srcNode = null;
@@ -35,61 +37,82 @@
     return ac;
   }
   function applyVolume() { if (gain) gain.gain.value = settings.vol / 100; }
-  function click(freq, dur, vol) {
+  const clickBufs = new Map();
+  function click(freq, dur, vol) {                 // pre-rendered one-shot buffers: no node graph building on the hot path
     if (!ac || settings.vol === 0) return;
-    const o = ac.createOscillator(), e = ac.createGain();
-    o.frequency.value = freq; e.gain.setValueAtTime(vol, ac.currentTime);
-    e.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
-    o.connect(e); e.connect(gain); o.start(); o.stop(ac.currentTime + dur);
+    const key = freq + '|' + dur + '|' + vol;
+    let buf = clickBufs.get(key);
+    if (!buf) {
+      const n = Math.floor(ac.sampleRate * dur); buf = ac.createBuffer(1, n, ac.sampleRate);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < n; i++) d[i] = vol * Math.sin(TAU * freq * i / ac.sampleRate) * Math.exp(-5 * i / n);
+      clickBufs.set(key, buf);
+    }
+    const src = ac.createBufferSource(); src.buffer = buf; src.connect(gain); src.start();
   }
   async function decode(arrayBuffer) {
     const a = audio();
     return new Promise((res, rej) => a.decodeAudioData(arrayBuffer.slice(0), res, rej));
   }
 
-  /* ---------------- loading ---------------- */
-  let entries = [];            // [{map, audioName, getAudio}]
+  /* ---------------- library / loading ---------------- */
+  const Lib = window.OzuLibrary;
+  let entries = [];            // difficulties of the opened set: [{map, getAudio, getBg}]
+  let setMetas = [];
+  let openId = null;
   const audioCache = new Map();
   const status = (msg, err) => { const s = $('status'); s.textContent = msg || ''; s.className = 'status' + (err ? ' err' : ''); };
 
-  async function loadFiles(list) {
+  async function importFiles(list) {
     try {
       audio();
-      status('Lade …');
-      const files = [...list];
-      const osz = files.find(f => /\.(osz|zip)$/i.test(f.name));
-      const osus = files.filter(f => /\.osu$/i.test(f.name));
-      const imgs = files.filter(f => /\.(jpe?g|png)$/i.test(f.name));
-      const auds = files.filter(f => /\.(mp3|ogg|wav|m4a|flac|opus)$/i.test(f.name) || f.type.startsWith('audio/'));
-      const texts = []; let getBytes;
-      audioCache.clear();
-      if (osz) {
-        const zip = await window.MiniZip.readZip(await osz.arrayBuffer());
-        for (const n of zip.names.filter(n => /\.osu$/i.test(n))) texts.push({ text: new TextDecoder().decode(await zip.read(n)), file: n });
-        getBytes = async name => {
-          const hit = zip.names.find(n => n.toLowerCase() === (name || '').toLowerCase());
-          return hit ? zip.read(hit) : null;
-        };
-      } else {
-        for (const f of osus) texts.push({ text: await f.text(), file: f.name });
-        getBytes = async name => {
-          const f = auds.find(a => a.name.toLowerCase() === (name || '').toLowerCase()) || auds[0];
-          return f ? f.arrayBuffer() : null;
-        };
+      const ids = await Lib.importFiles(list, (i, n) => status(`Importiere … ${i}/${n}`));
+      await refreshLibrary();
+      if (!ids.length) { status('Keine Beatmap gefunden (.osz, oder .osu + Audio).', true); return; }
+      status(`${ids.length} Beatmap-Set(s) importiert.`);
+      if (ids.length === 1) await openSet(ids[0]);
+    } catch (e) { console.error(e); status(e.message || String(e), true); }
+  }
+
+  async function refreshLibrary() {
+    try { setMetas = (await Lib.list()).sort((a, b) => a.artist.localeCompare(b.artist) || a.title.localeCompare(b.title)); } catch (e) { setMetas = []; }
+    renderLibrary();
+  }
+  function renderLibrary() {
+    const box = $('library'), q = $('search').value.trim().toLowerCase();
+    box.textContent = '';
+    const shown = setMetas.filter(m => !q || `${m.artist} ${m.title} ${m.creator}`.toLowerCase().includes(q)).slice(0, 200);
+    for (const m of shown) {
+      const row = document.createElement('div'); row.className = 'set' + (m.id === openId ? ' sel' : '');
+      const b = document.createElement('button');
+      const t = document.createElement('b'); t.textContent = `${m.artist} – ${m.title}`;
+      const em = document.createElement('em'); em.textContent = `${m.diffs.length} Diff · ${m.creator}`;
+      b.append(t, em); b.onclick = () => openSet(m.id);
+      const x = document.createElement('button'); x.className = 'del'; x.textContent = '✕'; x.title = 'Aus Bibliothek löschen';
+      x.onclick = async () => { await Lib.remove(m.id); if (openId === m.id) { openId = null; entries = []; showDiffs(); } refreshLibrary(); };
+      row.append(b, x); box.appendChild(row);
+    }
+    if (!setMetas.length) { const p = document.createElement('p'); p.className = 'help'; p.textContent = 'Noch keine Beatmaps importiert.'; box.appendChild(p); }
+    else if (setMetas.length > shown.length) { const p = document.createElement('p'); p.className = 'help'; p.textContent = `… ${setMetas.length - shown.length} weitere – Suche verwenden.`; box.appendChild(p); }
+  }
+
+  async function openSet(id) {
+    try {
+      status('Öffne …');
+      audio(); audioCache.clear();
+      const src = await Lib.open(id);
+      const list = [];
+      for (const n of src.osuFiles) {
+        const map = parseOsu(await src.text(n));
+        list.push({
+          map, file: n,
+          getAudio: () => cachedAudio(map.audioFile, src.bytes),
+          getBg: async () => { const bytes = map.background ? await src.bytes(map.background) : null; return bytes ? createImageBitmap(new Blob([bytes])) : null; },
+        });
       }
-      if (!texts.length) throw new Error('Keine .osu-Datei gefunden.');
-      entries = texts.map(t => {
-        const map = parseOsu(t.text);
-        return {
-          map, file: t.file, getAudio: () => cachedAudio(map.audioFile, getBytes),
-          getBg: async () => {
-            const bytes = osz ? await getBytes(map.background) : (imgs.find(f => f.name.toLowerCase() === (map.background || '').toLowerCase()) || imgs[0] || { arrayBuffer: async () => null }).arrayBuffer();
-            return bytes ? createImageBitmap(new Blob([await bytes])) : null;
-          },
-        };
-      });
-      showDiffs();
-      status(`${entries.length} Schwierigkeitsgrad(e) geladen – wähle einen.`);
+      entries = list; openId = id;
+      renderLibrary(); showDiffs();
+      status('Wähle einen Schwierigkeitsgrad.');
     } catch (e) { console.error(e); status(e.message || String(e), true); }
   }
   async function cachedAudio(name, getBytes) {
@@ -110,9 +133,9 @@
     for (const en of sorted) {
       const m = en.map, b = document.createElement('button');
       b.disabled = !SUPPORTED.has(m.mode) || !m.objects.length;
-      const t = document.createElement('b'); t.textContent = `${m.artist} – ${m.title}`;
+      const t = document.createElement('b'); t.textContent = `[${m.versionName}]`;
       const em = document.createElement('em'); em.textContent = `${MODE_NAMES[m.mode] || 'Modus ' + m.mode}${b.disabled ? ' (nicht unterstützt)' : ''}`;
-      b.append(t, document.createTextNode(` [${m.versionName}] · CS${m.diff.cs} AR${m.diff.ar} OD${m.diff.od} · ${m.objects.length} Objekte `), em);
+      b.append(t, document.createTextNode(` CS${m.diff.cs} AR${m.diff.ar} OD${m.diff.od} HP${m.diff.hp} · ${m.objects.length} Objekte `), em);
       b.onclick = () => startGame(en);
       box.appendChild(b);
     }
@@ -272,10 +295,11 @@
       s.combo++; if (s.combo > s.maxCombo) s.maxCombo = s.combo;
       setHealth(grade === 300 ? 0.035 : grade === 100 ? 0.02 : 0.006);
     } else { s.combo = 0; setHealth(-(0.04 + 0.008 * G.map.diff.hp)); }
-    G.pops.push({ t: nowT(), x, y, grade });
+    if (G.mode === 1 || settings.fx) G.pops.push({ t: nowT(), x, y, grade });
   }
-  function partHit(it, pts, x, y) { addScore(pts); G.stats.combo++; G.stats.maxCombo = Math.max(G.stats.maxCombo, G.stats.combo); G.stats.score += 0; it.partsHit++; setHealth(0.008); G.effects.push({ t: nowT(), x, y, k: 'ring' }); }
-  function partMiss(x, y) { G.stats.combo = 0; setHealth(-0.02); G.pops.push({ t: nowT(), x, y, grade: -1 }); }
+  function fxPush(e) { if (settings.fx) G.effects.push(e); }
+  function partHit(it, pts, x, y) { addScore(pts); G.stats.combo++; G.stats.maxCombo = Math.max(G.stats.maxCombo, G.stats.combo); G.stats.score += 0; it.partsHit++; setHealth(0.008); fxPush({ t: nowT(), x, y, k: 'ring' }); }
+  function partMiss(x, y) { G.stats.combo = 0; setHealth(-0.02); if (settings.fx) G.pops.push({ t: nowT(), x, y, grade: -1 }); }
 
   /* ---------------- input ---------------- */
   const KEYMAP_STD = { KeyZ: 'z', KeyX: 'x' };
@@ -344,7 +368,7 @@
       if (grade) G.hitErr.push({ t, dt });
       if (it.type === 'circle') {
         it.done = it.judged = true; judge(grade, it.x, it.y);
-        G.effects.push({ t: nowT(), x: it.x, y: it.y, k: grade ? 'hit' : 'miss', it });
+        fxPush({ t: nowT(), x: it.x, y: it.y, k: grade ? 'hit' : 'miss', it });
       } else if (grade) { it.partsHit++; addScore(30); G.stats.combo++; G.stats.maxCombo = Math.max(G.stats.maxCombo, G.stats.combo); setHealth(0.01); it.headHit = true; }
       else partMiss(it.x, it.y);
       if (grade) click(it.type === 'circle' ? 900 : 700, 0.04, 0.25);
@@ -358,7 +382,7 @@
       if (it.time - G.preempt > t) break;
       if (it.done) continue;
       if (it.type === 'circle') {
-        if (t > it.time + G.w50) { it.done = it.judged = true; judge(0, it.x, it.y); G.effects.push({ t, x: it.x, y: it.y, k: 'miss', it }); }
+        if (t > it.time + G.w50) { it.done = it.judged = true; judge(0, it.x, it.y); fxPush({ t, x: it.x, y: it.y, k: 'miss', it }); }
       } else if (it.type === 'slider') {
         if (!it.headDone && t > it.time + G.w50) { it.headDone = true; partMiss(it.x, it.y); }
         if (t >= it.time) trackSlider(it, t);
@@ -386,10 +410,10 @@
       const grade = ratio >= 0.999 ? 300 : ratio >= 0.5 ? 100 : ratio > 0 ? 50 : 0;
       const s = G.stats; s.judged++;
       if (grade === 300) s.n300++; else if (grade === 100) s.n100++; else if (grade === 50) s.n50++; else s.nMiss++;
-      G.pops.push({ t, x: it.endX, y: it.endY, grade });
+      if (settings.fx) G.pops.push({ t, x: it.endX, y: it.endY, grade });
       setHealth(grade === 300 ? 0.035 : grade ? 0.015 : -0.05);
-      it.done = true;
-      G.effects.push({ t, x: it.endX, y: it.endY, k: 'ring' });
+      it.done = true; it.bodyC = null;
+      fxPush({ t, x: it.endX, y: it.endY, k: 'ring' });
     }
   }
   function spin(it, t) {
@@ -504,6 +528,7 @@
     const t = nowT();
     if (G.mode === 0 && !G.over && t > G.map.firstTime && t < G.map.lastTime && !inBreak(t)) setHealth(-(0.012 + 0.003 * G.map.diff.hp) * G.dt / 1000);
     if (settings.autoplay) autoplay(t);
+    if (G.mode === 0) prebuildBodies(t);
     if (G.mode === 0) stdUpdate(t); else taikoUpdate(t);
     if (!G.over && t > G.endMs && G.ptr >= G.items.length) finish(false);
     render(t);
@@ -550,7 +575,7 @@
     ps = Math.min(H * 0.82 / 384, W * 0.9 / 512);
     ox = (W - 512 * ps) / 2; oy = (H - 384 * ps) / 2 + H * 0.02;
     g.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
-    sprites.clear(); if (G) buildBg();
+    sprites.clear(); if (G) { buildBg(); for (const it of G.items) it.bodyC = undefined; }
   }
   window.addEventListener('resize', resize);
   resize();
@@ -672,20 +697,23 @@
   }
 
   function renderCursor() {
-    const tr = G.trail, c = G.cursor, x = ox + c.x * ps, y = oy + c.y * ps;
-    tr.push(x, y); if (tr.length > 28) tr.splice(0, 2);
-    g.lineCap = 'round'; g.lineWidth = Math.max(3, 9 * ps * 0.8);
-    for (let i = 2; i < tr.length; i += 2) {
-      g.globalAlpha = (i / tr.length) * 0.35; g.strokeStyle = '#ff9bd0';
-      g.beginPath(); g.moveTo(tr[i - 2], tr[i - 1]); g.lineTo(tr[i], tr[i + 1]); g.stroke();
+    const c = G.cursor, x = ox + c.x * ps, y = oy + c.y * ps;
+    if (settings.fx) {
+      const tr = G.trail; tr.push(x, y); if (tr.length > 28) tr.splice(0, 2);
+      g.lineCap = 'round'; g.lineWidth = Math.max(3, 9 * ps * 0.8);
+      for (let i = 2; i < tr.length; i += 2) {
+        g.globalAlpha = (i / tr.length) * 0.35; g.strokeStyle = '#ff9bd0';
+        g.beginPath(); g.moveTo(tr[i - 2], tr[i - 1]); g.lineTo(tr[i], tr[i + 1]); g.stroke();
+      }
+      g.globalAlpha = 1;
     }
-    g.globalAlpha = 1;
+    if (settings.hw && !settings.autoplay && !document.pointerLockElement) return;     // the OS draws it, zero added latency
     const r = Math.max(5, 9 * ps * 0.8) * (G.held.size ? 1.25 : 1);
     g.fillStyle = '#fff'; g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
     g.lineWidth = 2; g.strokeStyle = G.held.size ? '#ff66aa' : '#c9c2ee'; g.stroke();
   }
 
-  function drawSlider(it, t, a, R) {
+  function sliderPath(it) {
     if (!it.p2d) {
       it.p2d = new Path2D();
       const { xs, ys } = it.path;
@@ -694,22 +722,55 @@
       const rgb = rgbOf(colour(it));
       it.body = `rgb(${rgb.map(v => Math.round(v * 0.22 + 14)).join(',')})`;
     }
-    const sp = clamp((t - (it.time - G.preempt)) / (G.preempt * 0.45), 0, 1);   // snaking-in
-    g.save();
-    g.translate(ox, oy); g.scale(ps, ps);
-    g.lineCap = 'round'; g.lineJoin = 'round'; g.globalAlpha = a;
-    if (sp < 1) g.setLineDash([sp * it.path.total, 1e6]);
-    g.lineWidth = G.radius * 2; g.strokeStyle = '#fff'; g.stroke(it.p2d);
-    g.lineWidth = G.radius * 2 * 0.86; g.strokeStyle = it.body; g.stroke(it.p2d);
-    if (sp < 1) g.setLineDash([]);
+    return it.p2d;
+  }
+  function strokeBody(x, p2d, it) {
+    x.lineCap = 'round'; x.lineJoin = 'round';
+    x.lineWidth = G.radius * 2; x.strokeStyle = '#fff'; x.stroke(p2d);
+    x.lineWidth = G.radius * 2 * 0.86; x.strokeStyle = it.body; x.stroke(p2d);
+  }
+  /* Slider body rendered once into a bitmap, afterwards a single drawImage per frame. */
+  function sliderBody(it) {
+    if (it.bodyC !== undefined) return it.bodyC;
+    const P = it.path; let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    for (let i = 0; i < P.xs.length; i++) { x0 = Math.min(x0, P.xs[i]); x1 = Math.max(x1, P.xs[i]); y0 = Math.min(y0, P.ys[i]); y1 = Math.max(y1, P.ys[i]); }
+    const pad = G.radius + 3, k = canvas.width / W, wl = (x1 - x0 + 2 * pad) * ps, hl = (y1 - y0 + 2 * pad) * ps;
+    if (wl * hl * k * k > 6e6) return (it.bodyC = null);
+    const c = document.createElement('canvas'); c.width = Math.ceil(wl * k); c.height = Math.ceil(hl * k);
+    const x = c.getContext('2d'); x.scale(k * ps, k * ps); x.translate(pad - x0, pad - y0);
+    strokeBody(x, sliderPath(it), it);
+    return (it.bodyC = { c, x: x0 - pad, y: y0 - pad, w: wl, h: hl });
+  }
+  function prebuildBodies(t) {                      // spread bitmap creation over frames, ahead of time
+    if (settings.fx) return;
+    for (let i = G.ptr; i < G.items.length; i++) {
+      const it = G.items[i];
+      if (it.time - G.preempt - 1500 > t) break;
+      if (it.type === 'slider' && it.bodyC === undefined && !it.done) { sliderBody(it); return; }
+    }
+  }
+
+  function drawSlider(it, t, a, R) {
+    const fx = settings.fx;
+    const sp = fx ? clamp((t - (it.time - G.preempt)) / (G.preempt * 0.45), 0, 1) : 1;   // snaking-in (effects only)
+    const body = fx ? null : sliderBody(it);
+    if (body) { g.globalAlpha = a; g.drawImage(body.c, ox + body.x * ps, oy + body.y * ps, body.w, body.h); }
+    else {
+      const p2d = sliderPath(it);
+      g.save(); g.translate(ox, oy); g.scale(ps, ps); g.globalAlpha = a;
+      if (sp < 1) g.setLineDash([sp * it.path.total, 1e6]);
+      strokeBody(g, p2d, it);
+      g.restore();
+    }
     if (sp >= 1) {
-      g.fillStyle = '#fff';
+      g.fillStyle = '#fff'; g.globalAlpha = a * 0.9;
+      const tr = Math.max(1.5, G.radius * 0.1 * ps);
       for (let i = it.tickIdx; i < it.ticks.length; i++) {
         const k = it.ticks[i];
-        if (k.kind === 'tick') { g.globalAlpha = a * 0.9; g.beginPath(); g.arc(k.x, k.y, G.radius * 0.1, 0, TAU); g.fill(); }
+        if (k.kind === 'tick') { g.beginPath(); g.arc(ox + k.x * ps, oy + k.y * ps, tr, 0, TAU); g.fill(); }
       }
+      g.globalAlpha = 1;
     }
-    g.restore();
     // end circle + reverse arrow
     const ex = ox + it.endX * ps, ey = oy + it.endY * ps;
     const span = t < it.time ? -1 : Math.min(it.slides - 1, Math.floor((t - it.time) / it.spanDur));
@@ -721,7 +782,7 @@
       const atEnd = next % 2 === 1, P = it.path, n = P.xs.length;
       const px = atEnd ? P.xs[n - 1] : P.xs[0], py = atEnd ? P.ys[n - 1] : P.ys[0];
       const qx = atEnd ? P.xs[Math.max(0, n - 2)] : P.xs[Math.min(n - 1, 1)], qy = atEnd ? P.ys[Math.max(0, n - 2)] : P.ys[Math.min(n - 1, 1)];
-      const ang = Math.atan2(qy - py, qx - px), r = R * 0.45, pulse = 1 + 0.15 * Math.sin(t / 90);
+      const ang = Math.atan2(qy - py, qx - px), r = R * 0.45, pulse = fx ? 1 + 0.15 * Math.sin(t / 90) : 1;
       g.save(); g.translate(ox + px * ps, oy + py * ps); g.rotate(ang); g.scale(pulse, pulse);
       g.globalAlpha = a; g.fillStyle = '#fff'; g.beginPath(); g.moveTo(r, 0); g.lineTo(-r * 0.7, -r * 0.8); g.lineTo(-r * 0.7, r * 0.8); g.closePath(); g.fill();
       g.restore();
@@ -733,7 +794,8 @@
     }
     if (t >= it.time) {
       const p = sliderPos(it, t), bx = ox + p.x * ps, by = oy + p.y * ps;
-      it.fs = (it.fs || 1) + ((it.following ? 2.4 : 1) - (it.fs || 1)) * Math.min(1, G.dt / 90);
+      const goal = it.following ? 2.4 : 1;
+      it.fs = settings.fx ? (it.fs || 1) + (goal - (it.fs || 1)) * Math.min(1, G.dt / 90) : goal;
       blit(sprite(it, 0), bx, by, 0.95, 1);
       g.globalAlpha = it.following ? 0.9 : 0.4; g.lineWidth = Math.max(2, R * 0.1); g.strokeStyle = '#fff';
       g.beginPath(); g.arc(bx, by, R * it.fs, 0, TAU); g.stroke();
@@ -825,11 +887,15 @@
   }
 
   /* ---------------- UI wiring ---------------- */
-  $('files').onchange = e => { if (e.target.files.length) loadFiles(e.target.files); };
+  $('files').onchange = e => { if (e.target.files.length) importFiles(e.target.files); e.target.value = ''; };
+  $('dir').onchange = e => { if (e.target.files.length) importFiles(e.target.files); e.target.value = ''; };
+  $('pickDir').onclick = () => $('dir').click();
+  $('search').oninput = renderLibrary;
   const drop = $('drop');
   ['dragenter', 'dragover'].forEach(ev => window.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
   ['dragleave', 'drop'].forEach(ev => window.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
-  window.addEventListener('drop', e => { if (e.dataTransfer && e.dataTransfer.files.length) loadFiles(e.dataTransfer.files); });
+  window.addEventListener('drop', e => { if (e.dataTransfer && e.dataTransfer.files.length) importFiles(e.dataTransfer.files); });
+  refreshLibrary();
 
   function demo(kind) {
     const a = audio();
@@ -844,7 +910,7 @@
   $('retry').onclick = () => startGame(lastEntry);
   $('quit').onclick = toMenu;
   $('resRetry').onclick = () => startGame(lastEntry);
-  $('resQuit').onclick = () => { toMenu(); showDiffs(); };
+  $('resQuit').onclick = toMenu;
 
   window.__ozu = { get game() { return G; } };    // debugging / tests
   render(0);
