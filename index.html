@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ozu Web</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<canvas id="screen"></canvas>
+
+<section id="menu" class="overlay">
+  <div class="panel">
+    <h1>Ozu&nbsp;Web <small>osu! im Browser · Standard &amp; Taiko</small></h1>
+
+    <label id="drop" class="drop">
+      <input id="files" type="file" multiple accept=".osz,.osu,audio/*,.mp3,.ogg,.wav">
+      <b>.osz</b> hierher ziehen oder klicken – oder <b>.osu</b> + Audiodatei zusammen auswählen.
+    </label>
+
+    <div class="row">
+      <button id="demoStd">Demo: Standard</button>
+      <button id="demoTaiko">Demo: Taiko</button>
+    </div>
+
+    <div id="status" class="status"></div>
+    <div id="diffs" class="diffs"></div>
+
+    <details open>
+      <summary>Einstellungen</summary>
+      <div class="settings">
+        <label>Lautstärke <input id="vol" type="range" min="0" max="100" value="60"></label>
+        <label>Audio-Offset (ms) <input id="offset" type="number" value="0" step="5"></label>
+        <label>Render-Auflösung
+          <select id="scale"><option value="1">100 %</option><option value="0.75">75 %</option><option value="0.5">50 % (schwacher PC)</option></select>
+        </label>
+        <label><input id="noFail" type="checkbox" checked> No Fail</label>
+        <label><input id="autoplay" type="checkbox"> Autoplay (Test)</label>
+      </div>
+    </details>
+
+    <p class="help">
+      <b>Standard:</b> Maus bewegen, <kbd>Z</kbd>/<kbd>X</kbd> oder Maustasten klicken.
+      <b>Taiko:</b> <kbd>F</kbd>/<kbd>J</kbd> = Don (rot), <kbd>D</kbd>/<kbd>K</kbd> = Kat (blau).
+      <kbd>Esc</kbd> = Pause, <kbd>`</kbd> = Neustart.
+    </p>
+  </div>
+</section>
+
+<section id="pause" class="overlay hidden">
+  <div class="panel small">
+    <h2>Pause</h2>
+    <div class="row">
+      <button id="resume">Weiter</button>
+      <button id="retry">Neustart</button>
+      <button id="quit">Menü</button>
+    </div>
+  </div>
+</section>
+
+<section id="result" class="overlay hidden">
+  <div class="panel small">
+    <h2 id="resTitle"></h2>
+    <div id="resRank" class="rank"></div>
+    <div id="resStats" class="stats"></div>
+    <div class="row">
+      <button id="resRetry">Nochmal</button>
+      <button id="resQuit">Menü</button>
+    </div>
+  </div>
+</section>
+
+<script src="parser.js"></script>
+<script src="zip.js"></script>
+<script src="demo.js"></script>
+<script src="game.js"></script>
+</body>
+</html>

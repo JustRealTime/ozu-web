@@ -1,0 +1,40 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: #0d0b14; color: #eee; font: 15px/1.4 system-ui, "Segoe UI", sans-serif; overflow: hidden; }
+canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+body.playing canvas { cursor: none; }
+
+.overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(8, 6, 14, .82); overflow: auto; padding: 16px; }
+.overlay.hidden { display: none; }
+.panel { width: min(640px, 100%); background: #1b1730; border: 1px solid #3a3260; border-radius: 12px; padding: 22px 24px; }
+.panel.small { width: min(420px, 100%); text-align: center; }
+h1 { margin: 0 0 14px; font-size: 26px; color: #ff66aa; }
+h1 small { display: block; font-size: 13px; color: #9a92c0; font-weight: normal; }
+h2 { margin: 0 0 12px; }
+
+.drop { display: block; border: 2px dashed #5a4f90; border-radius: 10px; padding: 22px; text-align: center; cursor: pointer; color: #bdb6e0; }
+.drop.over { border-color: #ff66aa; background: #271f45; }
+.drop input { display: none; }
+
+.row { display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0; justify-content: center; }
+button { background: #ff66aa; color: #1a0b14; border: 0; border-radius: 8px; padding: 9px 16px; font: inherit; font-weight: 600; cursor: pointer; }
+button:hover { filter: brightness(1.1); }
+button:disabled { opacity: .4; cursor: not-allowed; }
+
+.status { min-height: 1.4em; color: #ffd27a; margin: 6px 0; }
+.status.err { color: #ff7a7a; }
+.diffs { display: grid; gap: 6px; margin-bottom: 10px; max-height: 38vh; overflow: auto; }
+.diffs button { text-align: left; background: #2a2450; color: #eee; font-weight: normal; }
+.diffs button b { color: #ff66aa; }
+.diffs button em { float: right; color: #9a92c0; font-style: normal; }
+
+details { margin-top: 8px; }
+summary { cursor: pointer; color: #9a92c0; }
+.settings { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 10px 0; }
+.settings label { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.settings input[type=number] { width: 80px; }
+.help { color: #9a92c0; font-size: 13px; }
+kbd { background: #2a2450; border: 1px solid #4a4180; border-radius: 4px; padding: 0 5px; }
+
+.rank { font-size: 72px; font-weight: 800; color: #ffd27a; line-height: 1.1; }
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; text-align: left; margin: 10px 0; }
+.stats span:nth-child(even) { text-align: right; font-variant-numeric: tabular-nums; }
