@@ -14,7 +14,7 @@
     <h1>Ozu&nbsp;Web <small>osu! im Browser · Standard &amp; Taiko</small></h1>
 
     <label id="drop" class="drop">
-      <input id="files" type="file" multiple accept=".osz,.osu,audio/*,.mp3,.ogg,.wav">
+      <input id="files" type="file" multiple accept=".osz,.osu,audio/*,image/*,.mp3,.ogg,.wav">
       <b>.osz</b> hierher ziehen oder klicken – oder <b>.osu</b> + Audiodatei zusammen auswählen.
     </label>
 
@@ -36,6 +36,9 @@
         </label>
         <label><input id="noFail" type="checkbox" checked> No Fail</label>
         <label><input id="autoplay" type="checkbox"> Autoplay (Test)</label>
+        <label><input id="fps" type="checkbox"> FPS anzeigen</label>
+        <label><input id="bg" type="checkbox"> Hintergrundbild</label>
+        <label title="Raw Input: Cursor wird relativ und ohne Windows-Beschleunigung bewegt (Klick ins Spiel)"><input id="lock" type="checkbox"> Maus sperren (Raw)</label>
       </div>
     </details>
 

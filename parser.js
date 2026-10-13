@@ -29,6 +29,7 @@
       } else if (sec === 'Events') {
         const p = line.split(',');
         if (p[0] === '2' || p[0] === 'Break') m.breaks.push({ start: +p[1], end: +p[2] });
+        else if ((p[0] === '0') && p[2] && !m.background) m.background = p[2].replace(/"/g, '').trim();
       } else if (sec === 'Colours') {
         const mm = /^Combo\d+\s*:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(line);
         if (mm) m.colours.push(`rgb(${mm[1]},${mm[2]},${mm[3]})`);
@@ -57,6 +58,7 @@
     m.creator = m.metadata.Creator || '';
     m.audioFile = m.general.AudioFilename || '';
     m.audioLeadIn = num(m.general.AudioLeadIn, 0);
+    m.stackLeniency = num(m.general.StackLeniency, 0.7);
 
     buildTiming(m, rawTiming);
     buildObjects(m, rawObjects);

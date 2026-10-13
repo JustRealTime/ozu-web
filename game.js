@@ -6,13 +6,13 @@
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
   const TAU = Math.PI * 2;
   const canvas = $('screen');
-  const g = canvas.getContext('2d', { alpha: false });
+  const g = canvas.getContext('2d', { alpha: false, desynchronized: true });
   const MODE_NAMES = ['osu!standard', 'osu!taiko', 'osu!catch', 'osu!mania'];
   const SUPPORTED = new Set([0, 1]);
   const DEFAULT_COLOURS = ['#ff9bd0', '#7fd1ff', '#a5ff8c', '#ffd27a'];
 
   /* ---------------- settings ---------------- */
-  const settings = { vol: 60, offset: 0, scale: 1, noFail: true, autoplay: false };
+  const settings = { vol: 60, offset: 0, scale: 1, noFail: true, autoplay: false, fps: true, bg: true, lock: false };
   try { Object.assign(settings, JSON.parse(localStorage.getItem('ozu-settings') || '{}')); } catch (e) { /* ignore */ }
   function saveSettings() { try { localStorage.setItem('ozu-settings', JSON.stringify(settings)); } catch (e) { /* ignore */ } }
   $('vol').value = settings.vol; $('offset').value = settings.offset; $('scale').value = String(settings.scale);
@@ -22,6 +22,7 @@
   $('scale').onchange = e => { settings.scale = +e.target.value; resize(); saveSettings(); };
   $('noFail').onchange = e => { settings.noFail = e.target.checked; saveSettings(); };
   $('autoplay').onchange = e => { settings.autoplay = e.target.checked; saveSettings(); };
+  for (const k of ['fps', 'bg', 'lock']) { $(k).checked = settings[k]; $(k).onchange = e => { settings[k] = e.target.checked; saveSettings(); }; }
 
   /* ---------------- audio ---------------- */
   let ac = null, gain = null, srcNode = null;
@@ -58,6 +59,7 @@
       const files = [...list];
       const osz = files.find(f => /\.(osz|zip)$/i.test(f.name));
       const osus = files.filter(f => /\.osu$/i.test(f.name));
+      const imgs = files.filter(f => /\.(jpe?g|png)$/i.test(f.name));
       const auds = files.filter(f => /\.(mp3|ogg|wav|m4a|flac|opus)$/i.test(f.name) || f.type.startsWith('audio/'));
       const texts = []; let getBytes;
       audioCache.clear();
@@ -78,7 +80,13 @@
       if (!texts.length) throw new Error('Keine .osu-Datei gefunden.');
       entries = texts.map(t => {
         const map = parseOsu(t.text);
-        return { map, file: t.file, getAudio: () => cachedAudio(map.audioFile, getBytes) };
+        return {
+          map, file: t.file, getAudio: () => cachedAudio(map.audioFile, getBytes),
+          getBg: async () => {
+            const bytes = osz ? await getBytes(map.background) : (imgs.find(f => f.name.toLowerCase() === (map.background || '').toLowerCase()) || imgs[0] || { arrayBuffer: async () => null }).arrayBuffer();
+            return bytes ? createImageBitmap(new Blob([await bytes])) : null;
+          },
+        };
       });
       showDiffs();
       status(`${entries.length} Schwierigkeitsgrad(e) geladen – wähle einen.`);
@@ -131,11 +139,11 @@
     const drain = Math.max(1, (m.lastTime - m.firstTime) / 1000);
     G = {
       map: m, mode: m.mode, items, ptr: 0, buffer,
-      clock: { running: false, base: 0, ctxStart: 0 },
+      clock: { running: false, base: 0, ctxStart: 0, perfRef: 0, songRef: 0, corr: 0 },
       paused: false, over: false,
       stats: { score: 0, combo: 0, maxCombo: 0, n300: 0, n100: 0, n50: 0, nMiss: 0, health: 1, judged: 0, rollHits: 0 },
       held: new Set(), cursor: { x: 256, y: 192 }, autoHold: 0,
-      effects: [], pops: [], flash: null,
+      effects: [], pops: [], flash: null, trail: [], hitErr: [], dt: 16, lastFrame: 0, fps: 60, bg: null,
       diffMult: Math.round((df.hp + df.od + df.cs + clamp(n / drain * 8, 0, 16)) / 38 * 5),
     };
     if (m.mode === 0) {
@@ -154,6 +162,10 @@
       if (m.mode === 1 && it.type === 'circle') it.kat = !!(it.hitSound & (2 | 8)), it.big = !!(it.hitSound & 4);
       if (m.mode === 1 && it.type === 'spinner') it.required = Math.max(3, Math.round((it.endTime - it.time) / 1000 * 6));
     }
+    if (m.mode === 0) applyStacking(items, G.preempt * m.stackLeniency, df.cs);
+    sprites.clear();
+    G.bgImg = null;
+    if (en.getBg && m.background) { try { G.bgImg = await en.getBg(); } catch (e) { /* no background */ } buildBg(); }
     G.startMs = m.firstTime - 2500;
     G.endMs = m.lastTime + 1200;
     if (buffer) G.endMs = Math.max(G.endMs, 0); // audio may continue after the map; we end with the map
@@ -165,24 +177,69 @@
     rafId = requestAnimationFrame(frame);
   }
 
+  /* osu! stacking: overlapping objects get shifted diagonally (same algorithm as osu!lazer's legacy stacking). */
+  function applyStacking(items, threshold, cs) {
+    const dist = (x1, y1, x2, y2) => Math.hypot(x1 - x2, y1 - y2), SD = 3;
+    for (const o of items) { o.stack = 0; o.ex = o.type === 'slider' ? o.endX : o.x; o.ey = o.type === 'slider' ? o.endY : o.y; }
+    for (let i = items.length - 1; i > 0; i--) {
+      let oi = items[i];
+      if (oi.stack !== 0 || oi.type === 'spinner') continue;
+      for (let n = i - 1; n >= 0; n--) {
+        const on = items[n];
+        if (on.type === 'spinner') continue;
+        if (oi.time - on.endTime > threshold) break;
+        if (oi.type === 'circle' && on.type === 'slider' && dist(on.ex, on.ey, oi.x, oi.y) < SD) {
+          const off = oi.stack - on.stack + 1;
+          for (let j = n + 1; j <= i; j++) if (dist(on.ex, on.ey, items[j].x, items[j].y) < SD) items[j].stack -= off;
+          break;
+        }
+        const hit = oi.type === 'circle' ? dist(on.x, on.y, oi.x, oi.y) < SD : dist(on.ex, on.ey, oi.x, oi.y) < SD;
+        if (hit) { on.stack = oi.stack + 1; oi = on; }
+      }
+    }
+    const k = (1 - 0.7 * (cs - 5) / 5) / 2 * -6.4;
+    for (const o of items) {
+      if (!o.stack) continue;
+      const d = o.stack * k;
+      o.x += d; o.y += d; o.endX += d; o.endY += d;
+      if (o.type === 'slider') {
+        o.path = Object.assign({}, o.path, { xs: o.path.xs.map(v => v + d), ys: o.path.ys.map(v => v + d) });
+        o.ticks = o.ticks.map(t => Object.assign({}, t, { x: t.x + d, y: t.y + d }));
+      }
+    }
+  }
+
+  /* Clock: free-running performance.now() timeline, gently steered toward the audio device's
+     real output position (getOutputTimestamp). Gives frame-exact, jitter-free time + latency compensation. */
   function playFrom(ms) {
     stopAudio();
-    const c = ac;
-    G.clock.ctxStart = c.currentTime; G.clock.base = ms; G.clock.running = true;
+    const c = ac, when = c.currentTime + 0.12, k = G.clock;
+    k.ctxStart = when; k.base = ms; k.running = true;
+    k.perfRef = performance.now(); k.songRef = ms - 120; k.corr = 0;
     if (G.buffer) {
       srcNode = c.createBufferSource(); srcNode.buffer = G.buffer; srcNode.connect(gain);
-      if (ms >= 0) srcNode.start(c.currentTime, ms / 1000); else srcNode.start(c.currentTime - ms / 1000, 0);
+      if (ms >= 0) srcNode.start(when, ms / 1000); else srcNode.start(when - ms / 1000, 0);
     }
   }
   function stopAudio() { if (srcNode) { try { srcNode.stop(); } catch (e) { /* ignore */ } srcNode.disconnect(); srcNode = null; } }
-  const rawTime = () => G.clock.running ? (ac.currentTime - G.clock.ctxStart) * 1000 + G.clock.base : G.clock.base;
-  const latency = () => ((ac && (ac.outputLatency || ac.baseLatency)) || 0) * 1000 + settings.offset;
-  const nowT = () => rawTime() - latency();
+  function syncClock() {
+    const k = G.clock;
+    if (!k.running || !ac.getOutputTimestamp) return;
+    const ts = ac.getOutputTimestamp();
+    if (!ts.contextTime || !ts.performanceTime) return;
+    const p = performance.now();
+    const heard = ts.contextTime + (p - ts.performanceTime) / 1000;
+    const target = (heard - k.ctxStart) * 1000 + k.base - ((p - k.perfRef) + k.songRef);
+    if (Math.abs(target - k.corr) > 40) k.corr = target; else k.corr += (target - k.corr) * 0.04;
+  }
+  const rawTime = () => { const k = G.clock; return k.running ? performance.now() - k.perfRef + k.songRef + k.corr : k.base; };
+  const nowT = () => rawTime() - settings.offset;
 
   function pause() {
     if (!G || G.paused || G.over) return;
     G.clock.base = rawTime(); G.clock.running = false; G.paused = true; stopAudio();
     G.held.clear();
+    if (document.pointerLockElement) document.exitPointerLock();
     document.body.classList.remove('playing');
     $('pause').classList.remove('hidden');
   }
@@ -217,7 +274,7 @@
     } else { s.combo = 0; setHealth(-(0.04 + 0.008 * G.map.diff.hp)); }
     G.pops.push({ t: nowT(), x, y, grade });
   }
-  function partHit(it, pts, x, y) { addScore(pts); G.stats.combo++; G.stats.maxCombo = Math.max(G.stats.maxCombo, G.stats.combo); G.stats.score += 0; it.partsHit++; setHealth(0.008); G.effects.push({ t: nowT(), x, y, c: '#fff', r: 8 }); }
+  function partHit(it, pts, x, y) { addScore(pts); G.stats.combo++; G.stats.maxCombo = Math.max(G.stats.maxCombo, G.stats.combo); G.stats.score += 0; it.partsHit++; setHealth(0.008); G.effects.push({ t: nowT(), x, y, k: 'ring' }); }
   function partMiss(x, y) { G.stats.combo = 0; setHealth(-0.02); G.pops.push({ t: nowT(), x, y, grade: -1 }); }
 
   /* ---------------- input ---------------- */
@@ -246,17 +303,29 @@
   });
   canvas.addEventListener('mousedown', e => {
     if (!G || G.paused || G.over) return;
+    if (G.mode === 0 && settings.lock && !document.pointerLockElement) lockPointer();
     moveCursor(e);
     const t = evTime(e);
     if (G.mode === 0) press('m' + e.button, t); else press((e.button === 0 ? 'don' : 'kat') + 'm' + e.button, t);
   });
   window.addEventListener('mouseup', e => { if (G) { G.held.delete('m' + e.button); G.held.delete('donm' + e.button); G.held.delete('katm' + e.button); } });
   canvas.addEventListener('contextmenu', e => e.preventDefault());
-  canvas.addEventListener('mousemove', moveCursor);
+  // lowest-latency pointer stream available; raw (unaccelerated) relative mode when pointer lock is enabled
+  document.addEventListener('onpointerrawupdate' in window ? 'pointerrawupdate' : 'pointermove', moveCursor, { passive: true });
   function moveCursor(e) {
     if (!G || G.mode !== 0 || settings.autoplay) return;
-    G.cursor.x = (e.clientX - ox) / ps; G.cursor.y = (e.clientY - oy) / ps;
+    const c = G.cursor;
+    if (document.pointerLockElement === canvas) {
+      c.x = clamp(c.x + e.movementX / ps, -ox / ps, (W - ox) / ps); c.y = clamp(c.y + e.movementY / ps, -oy / ps, (H - oy) / ps);
+    } else { c.x = (e.clientX - ox) / ps; c.y = (e.clientY - oy) / ps; }
   }
+  function lockPointer() {
+    try {
+      const r = canvas.requestPointerLock({ unadjustedMovement: true });
+      if (r && r.catch) r.catch(() => { try { canvas.requestPointerLock(); } catch (e) { /* ignore */ } });
+    } catch (e) { /* ignore */ }
+  }
+  document.addEventListener('pointerlockchange', () => { if (!document.pointerLockElement && G && !G.over && !G.paused && settings.lock) pause(); });
   document.addEventListener('visibilitychange', () => { if (document.hidden) pause(); });
 
   /* -------- standard -------- */
@@ -272,9 +341,10 @@
       const adt = Math.abs(dt);
       const grade = dt < -G.w50 ? 0 : adt <= G.w300 ? 300 : adt <= G.w100 ? 100 : adt <= G.w50 ? 50 : 0;
       it.headDone = true;
+      if (grade) G.hitErr.push({ t, dt });
       if (it.type === 'circle') {
         it.done = it.judged = true; judge(grade, it.x, it.y);
-        G.effects.push({ t: nowT(), x: it.x, y: it.y, c: grade ? colour(it) : '#555', r: G.radius, big: true });
+        G.effects.push({ t: nowT(), x: it.x, y: it.y, k: grade ? 'hit' : 'miss', it });
       } else if (grade) { it.partsHit++; addScore(30); G.stats.combo++; G.stats.maxCombo = Math.max(G.stats.maxCombo, G.stats.combo); setHealth(0.01); it.headHit = true; }
       else partMiss(it.x, it.y);
       if (grade) click(it.type === 'circle' ? 900 : 700, 0.04, 0.25);
@@ -288,7 +358,7 @@
       if (it.time - G.preempt > t) break;
       if (it.done) continue;
       if (it.type === 'circle') {
-        if (t > it.time + G.w50) { it.done = it.judged = true; judge(0, it.x, it.y); }
+        if (t > it.time + G.w50) { it.done = it.judged = true; judge(0, it.x, it.y); G.effects.push({ t, x: it.x, y: it.y, k: 'miss', it }); }
       } else if (it.type === 'slider') {
         if (!it.headDone && t > it.time + G.w50) { it.headDone = true; partMiss(it.x, it.y); }
         if (t >= it.time) trackSlider(it, t);
@@ -319,7 +389,7 @@
       G.pops.push({ t, x: it.endX, y: it.endY, grade });
       setHealth(grade === 300 ? 0.035 : grade ? 0.015 : -0.05);
       it.done = true;
-      G.effects.push({ t, x: it.endX, y: it.endY, c: '#fff', r: G.radius });
+      G.effects.push({ t, x: it.endX, y: it.endY, k: 'ring' });
     }
   }
   function spin(it, t) {
@@ -331,6 +401,8 @@
         it.rot += Math.abs(d) / TAU;
       }
       it.prevA = a;
+      const whole = Math.floor(it.rot);
+      if (whole > (it.wholeRot || 0)) { G.stats.score += 100 * (whole - (it.wholeRot || 0)); it.wholeRot = whole; click(1600, 0.02, 0.1); }
       if (it.rot >= it.required && !it.cleared) { it.cleared = true; click(500, 0.12, 0.3); }
     }
     if (t >= it.endTime) {
@@ -425,12 +497,19 @@
     if (!G) return;
     rafId = requestAnimationFrame(frame);
     if (G.paused) { render(rawTime()); return; }
+    syncClock();
+    const pn = performance.now();
+    G.dt = G.lastFrame ? Math.min(100, pn - G.lastFrame) : 16; G.lastFrame = pn;
+    G.fps += (1000 / Math.max(1, G.dt) - G.fps) * 0.05;
     const t = nowT();
+    if (G.mode === 0 && !G.over && t > G.map.firstTime && t < G.map.lastTime && !inBreak(t)) setHealth(-(0.012 + 0.003 * G.map.diff.hp) * G.dt / 1000);
     if (settings.autoplay) autoplay(t);
     if (G.mode === 0) stdUpdate(t); else taikoUpdate(t);
     if (!G.over && t > G.endMs && G.ptr >= G.items.length) finish(false);
     render(t);
   }
+
+  function inBreak(t) { for (const b of G.map.breaks) if (t >= b.start && t <= b.end) return true; return false; }
 
   function rank(acc, miss) {
     if (acc >= 1) return 'SS';
@@ -448,6 +527,7 @@
   function finish(failed) {
     if (G.over) return;
     G.over = true; stopAudio();
+    if (document.pointerLockElement) document.exitPointerLock();
     document.body.classList.remove('playing');
     const s = G.stats, acc = accuracy();
     $('resTitle').textContent = (failed ? 'Gescheitert – ' : '') + `${G.map.artist} – ${G.map.title} [${G.map.versionName}]`;
@@ -461,6 +541,7 @@
   }
 
   /* ---------------- rendering ---------------- */
+  const sprites = new Map();
   let W = 0, H = 0, ps = 1, ox = 0, oy = 0;
   function resize() {
     W = window.innerWidth; H = window.innerHeight;
@@ -469,14 +550,23 @@
     ps = Math.min(H * 0.82 / 384, W * 0.9 / 512);
     ox = (W - 512 * ps) / 2; oy = (H - 384 * ps) / 2 + H * 0.02;
     g.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+    sprites.clear(); if (G) buildBg();
   }
   window.addEventListener('resize', resize);
   resize();
+  function buildBg() {
+    if (!G || !G.bgImg) { if (G) G.bg = null; return; }
+    const c = document.createElement('canvas'); c.width = canvas.width; c.height = canvas.height;
+    const x = c.getContext('2d'), im = G.bgImg, k = Math.max(c.width / im.width, c.height / im.height);
+    x.drawImage(im, (c.width - im.width * k) / 2, (c.height - im.height * k) / 2, im.width * k, im.height * k);
+    x.fillStyle = 'rgba(0,0,0,.82)'; x.fillRect(0, 0, c.width, c.height);
+    G.bg = c;
+  }
 
   const colour = it => (G.map.colours.length ? G.map.colours : DEFAULT_COLOURS)[it.colorIdx % (G.map.colours.length || DEFAULT_COLOURS.length)];
 
   function render(t) {
-    g.fillStyle = '#0d0b14'; g.fillRect(0, 0, W, H);
+    if (G && G.bg && settings.bg) g.drawImage(G.bg, 0, 0, W, H); else { g.fillStyle = '#0d0b14'; g.fillRect(0, 0, W, H); }
     if (!G) return;
     if (G.mode === 0) renderStd(t); else renderTaiko(t);
     renderHud(t);
@@ -494,90 +584,181 @@
     g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(String(n), x, y + r * 0.04); g.globalAlpha = 1;
   }
 
+  /* ---- sprite cache: circles are drawn once per (colour, number) and blitted every frame ---- */
+  function rgbOf(c) {
+    if (c[0] === '#') { const v = parseInt(c.slice(1), 16); return [(v >> 16) & 255, (v >> 8) & 255, v & 255]; }
+    const m = c.match(/\d+/g); return [+m[0], +m[1], +m[2]];
+  }
+  function sprite(it, num) {              // num > 0: numbered circle, 0: empty circle, -1: approach ring
+    const key = it.colorIdx * 100000 + num + 1;
+    let sp = sprites.get(key);
+    if (sp) return sp;
+    const R = G.radius * ps, k = canvas.width / W, size = Math.ceil((2 * R + 6) * k);
+    const c = document.createElement('canvas'); c.width = c.height = size;
+    const x = c.getContext('2d'); x.scale(k, k);
+    const h = size / (2 * k), rgb = rgbOf(colour(it));
+    if (num === -1) {
+      x.lineWidth = Math.max(1.5, R * 0.05); x.strokeStyle = `rgb(${rgb})`;
+      x.beginPath(); x.arc(h, h, R - x.lineWidth / 2, 0, TAU); x.stroke();
+    } else {
+      const gr = x.createRadialGradient(h, h, 0, h, h, R);
+      gr.addColorStop(0, `rgb(${rgb.map(v => Math.min(255, v + 70)).join(',')})`);
+      gr.addColorStop(1, `rgb(${rgb.map(v => Math.round(v * 0.82)).join(',')})`);
+      x.fillStyle = gr; x.beginPath(); x.arc(h, h, R * 0.95, 0, TAU); x.fill();
+      x.lineWidth = R * 0.03; x.strokeStyle = 'rgba(0,0,0,.28)'; x.beginPath(); x.arc(h, h, R * 0.8, 0, TAU); x.stroke();
+      x.lineWidth = R * 0.1; x.strokeStyle = '#fff'; x.beginPath(); x.arc(h, h, R - R * 0.05, 0, TAU); x.stroke();
+      if (num > 0) {
+        x.fillStyle = '#fff'; x.font = `bold ${Math.round(R * 0.95)}px system-ui,sans-serif`; x.textAlign = 'center'; x.textBaseline = 'middle';
+        x.shadowColor = 'rgba(0,0,0,.45)'; x.shadowBlur = R * 0.08; x.fillText(String(num), h, h + R * 0.04);
+      }
+    }
+    sp = { c, d: size / k }; sprites.set(key, sp);
+    return sp;
+  }
+  function blit(sp, x, y, scale, alpha) {
+    const d = sp.d * scale; g.globalAlpha = alpha; g.drawImage(sp.c, x - d / 2, y - d / 2, d, d);
+  }
+  function prune(arr, t, life) { let j = 0; for (let i = 0; i < arr.length; i++) if (t - arr[i].t < life) arr[j++] = arr[i]; arr.length = j; }
+
   function renderStd(t) {
-    const { items, preempt, fadeIn } = G, r = G.radius * ps;
+    const { items, preempt } = G, R = G.radius * ps;
     let hi = G.ptr;
     while (hi < items.length && items[hi].time - preempt <= t) hi++;
-    // later objects first so earlier ones lie on top
-    for (let i = hi - 1; i >= G.ptr; i--) {
+    g.lineCap = 'butt';
+    for (let i = hi - 1; i >= G.ptr; i--) {               // later objects first so earlier ones lie on top
       const it = items[i];
       if (it.done) continue;
       const x = ox + it.x * ps, y = oy + it.y * ps;
-      const a = clamp((t - (it.time - preempt)) / fadeIn, 0, 1);
+      const a = clamp((t - (it.time - preempt)) / (400 * Math.min(1, preempt / 450)), 0, 1);
       if (it.type === 'circle') {
-        discAt(x, y, r, colour(it), a); numberAt(x, y, r, it.combo, a);
-        if (t < it.time) { const k = 1 + 3 * (1 - clamp((t - (it.time - preempt)) / preempt, 0, 1)); g.globalAlpha = a; g.lineWidth = Math.max(1.5, r * 0.07); g.strokeStyle = colour(it); g.beginPath(); g.arc(x, y, r * k, 0, TAU); g.stroke(); g.globalAlpha = 1; }
-      } else if (it.type === 'slider') {
-        drawSlider(it, t, a, r);
-      } else {
-        drawSpinner(it, t, a);
-      }
+        blit(sprite(it, it.combo), x, y, 1, a);
+        if (t < it.time) blit(sprite(it, -1), x, y, 1 + 3 * (1 - clamp((t - (it.time - preempt)) / preempt, 0, 1)), Math.min(1, a * 2));
+      } else if (it.type === 'slider') drawSlider(it, t, a, R);
+      else drawSpinner(it, t, a);
     }
-    // effects
-    G.effects = G.effects.filter(e => t - e.t < 260);
+    // hit / miss fade-outs
+    prune(G.effects, t, 300);
     for (const e of G.effects) {
-      const f = (t - e.t) / 260;
-      g.globalAlpha = 1 - f; g.strokeStyle = e.c; g.lineWidth = 3;
-      g.beginPath(); g.arc(ox + e.x * ps, oy + e.y * ps, (e.r || 10) * ps * (1 + f * (e.big ? 0.5 : 1)), 0, TAU); g.stroke(); g.globalAlpha = 1;
+      const f = (t - e.t) / (e.k === 'hit' ? 260 : 300), x = ox + e.x * ps, y = oy + e.y * ps;
+      if (e.k === 'hit') blit(sprite(e.it, e.it.combo), x, y, 1 + 0.4 * f, 1 - f);
+      else if (e.k === 'miss') blit(sprite(e.it, e.it.combo), x, y, 1, (1 - f) * 0.6);
+      else { g.globalAlpha = 1 - f; g.strokeStyle = '#fff'; g.lineWidth = 3; g.beginPath(); g.arc(x, y, R * (0.4 + f * 0.8), 0, TAU); g.stroke(); }
     }
-    G.pops = G.pops.filter(p => t - p.t < 500);
+    g.globalAlpha = 1;
+    prune(G.pops, t, 500);
     g.font = `bold ${Math.round(16 * ps)}px system-ui,sans-serif`; g.textAlign = 'center'; g.textBaseline = 'middle';
     for (const p of G.pops) {
       if (p.grade === 300) continue;
-      g.globalAlpha = 1 - (t - p.t) / 500;
+      const f = (t - p.t) / 500;
+      g.globalAlpha = 1 - f;
       g.fillStyle = p.grade === 100 ? '#7fff7f' : p.grade === 50 ? '#ffd27a' : '#ff5c5c';
-      g.fillText(p.grade > 0 ? String(p.grade) : '✕', ox + p.x * ps, oy + (p.y - 20) * ps - (t - p.t) * 0.02);
+      g.fillText(p.grade > 0 ? String(p.grade) : '✕', ox + p.x * ps, oy + (p.y - 20) * ps - f * 10);
     }
     g.globalAlpha = 1;
-    // cursor
-    const cx = ox + G.cursor.x * ps, cy = oy + G.cursor.y * ps;
-    g.fillStyle = G.held.size ? '#ff66aa' : '#fff'; g.beginPath(); g.arc(cx, cy, Math.max(4, 7 * ps * 0.8), 0, TAU); g.fill();
+    renderErrorBar(t);
+    renderCursor();
   }
 
-  function drawSlider(it, t, a, r) {
+  function renderErrorBar(t) {
+    const bw = Math.min(W * 0.32, 420), sc = bw / G.w50, y = H - 26, cx = W / 2;
+    g.globalAlpha = 0.55;
+    g.fillStyle = '#e8a53a'; g.fillRect(cx - G.w50 * sc, y - 3, G.w50 * 2 * sc, 6);
+    g.fillStyle = '#7fff7f'; g.fillRect(cx - G.w100 * sc, y - 3, G.w100 * 2 * sc, 6);
+    g.fillStyle = '#7fd1ff'; g.fillRect(cx - G.w300 * sc, y - 3, G.w300 * 2 * sc, 6);
+    g.globalAlpha = 1; g.fillStyle = '#fff'; g.fillRect(cx - 1, y - 8, 2, 16);
+    prune(G.hitErr, t, 5000);
+    for (const e of G.hitErr) { g.globalAlpha = 1 - (t - e.t) / 5000; g.fillStyle = '#fff'; g.fillRect(cx + e.dt * sc - 1, y - 7, 2, 14); }
+    g.globalAlpha = 1;
+  }
+
+  function renderCursor() {
+    const tr = G.trail, c = G.cursor, x = ox + c.x * ps, y = oy + c.y * ps;
+    tr.push(x, y); if (tr.length > 28) tr.splice(0, 2);
+    g.lineCap = 'round'; g.lineWidth = Math.max(3, 9 * ps * 0.8);
+    for (let i = 2; i < tr.length; i += 2) {
+      g.globalAlpha = (i / tr.length) * 0.35; g.strokeStyle = '#ff9bd0';
+      g.beginPath(); g.moveTo(tr[i - 2], tr[i - 1]); g.lineTo(tr[i], tr[i + 1]); g.stroke();
+    }
+    g.globalAlpha = 1;
+    const r = Math.max(5, 9 * ps * 0.8) * (G.held.size ? 1.25 : 1);
+    g.fillStyle = '#fff'; g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+    g.lineWidth = 2; g.strokeStyle = G.held.size ? '#ff66aa' : '#c9c2ee'; g.stroke();
+  }
+
+  function drawSlider(it, t, a, R) {
     if (!it.p2d) {
       it.p2d = new Path2D();
       const { xs, ys } = it.path;
       it.p2d.moveTo(xs[0], ys[0]);
       for (let i = 1; i < xs.length; i++) it.p2d.lineTo(xs[i], ys[i]);
+      const rgb = rgbOf(colour(it));
+      it.body = `rgb(${rgb.map(v => Math.round(v * 0.22 + 14)).join(',')})`;
     }
+    const sp = clamp((t - (it.time - G.preempt)) / (G.preempt * 0.45), 0, 1);   // snaking-in
     g.save();
     g.translate(ox, oy); g.scale(ps, ps);
-    g.globalAlpha = a; g.lineCap = 'round'; g.lineJoin = 'round';
+    g.lineCap = 'round'; g.lineJoin = 'round'; g.globalAlpha = a;
+    if (sp < 1) g.setLineDash([sp * it.path.total, 1e6]);
     g.lineWidth = G.radius * 2; g.strokeStyle = '#fff'; g.stroke(it.p2d);
-    g.lineWidth = G.radius * 2 * 0.88; g.strokeStyle = '#1a1626'; g.stroke(it.p2d);
-    g.globalAlpha = a * 0.35; g.strokeStyle = colour(it); g.stroke(it.p2d);
-    g.globalAlpha = a;
-    for (let i = it.tickIdx; i < it.ticks.length; i++) {
-      const k = it.ticks[i];
-      g.fillStyle = k.kind === 'repeat' ? '#ffd27a' : '#fff';
-      g.beginPath(); g.arc(k.x, k.y, k.kind === 'repeat' ? G.radius * 0.35 : G.radius * 0.14, 0, TAU); g.fill();
+    g.lineWidth = G.radius * 2 * 0.86; g.strokeStyle = it.body; g.stroke(it.p2d);
+    if (sp < 1) g.setLineDash([]);
+    if (sp >= 1) {
+      g.fillStyle = '#fff';
+      for (let i = it.tickIdx; i < it.ticks.length; i++) {
+        const k = it.ticks[i];
+        if (k.kind === 'tick') { g.globalAlpha = a * 0.9; g.beginPath(); g.arc(k.x, k.y, G.radius * 0.1, 0, TAU); g.fill(); }
+      }
     }
     g.restore();
+    // end circle + reverse arrow
+    const ex = ox + it.endX * ps, ey = oy + it.endY * ps;
+    const span = t < it.time ? -1 : Math.min(it.slides - 1, Math.floor((t - it.time) / it.spanDur));
+    if (sp >= 0.98) {
+      blit(sprite(it, 0), it.slides % 2 ? ex : ox + it.path.xs[0] * ps, it.slides % 2 ? ey : oy + it.path.ys[0] * ps, 1, a * 0.85);
+    }
+    const next = span + 1;                                  // next reversal boundary
+    if (it.slides > 1 && next <= it.slides - 1 && sp >= 0.98) {
+      const atEnd = next % 2 === 1, P = it.path, n = P.xs.length;
+      const px = atEnd ? P.xs[n - 1] : P.xs[0], py = atEnd ? P.ys[n - 1] : P.ys[0];
+      const qx = atEnd ? P.xs[Math.max(0, n - 2)] : P.xs[Math.min(n - 1, 1)], qy = atEnd ? P.ys[Math.max(0, n - 2)] : P.ys[Math.min(n - 1, 1)];
+      const ang = Math.atan2(qy - py, qx - px), r = R * 0.45, pulse = 1 + 0.15 * Math.sin(t / 90);
+      g.save(); g.translate(ox + px * ps, oy + py * ps); g.rotate(ang); g.scale(pulse, pulse);
+      g.globalAlpha = a; g.fillStyle = '#fff'; g.beginPath(); g.moveTo(r, 0); g.lineTo(-r * 0.7, -r * 0.8); g.lineTo(-r * 0.7, r * 0.8); g.closePath(); g.fill();
+      g.restore();
+    }
     const x = ox + it.x * ps, y = oy + it.y * ps;
     if (!it.headDone) {
-      discAt(x, y, r, colour(it), a); numberAt(x, y, r, it.combo, a);
-      if (t < it.time) { const k = 1 + 3 * (1 - clamp((t - (it.time - G.preempt)) / G.preempt, 0, 1)); g.globalAlpha = a; g.lineWidth = Math.max(1.5, r * 0.07); g.strokeStyle = colour(it); g.beginPath(); g.arc(x, y, r * k, 0, TAU); g.stroke(); g.globalAlpha = 1; }
+      blit(sprite(it, it.combo), x, y, 1, a);
+      if (t < it.time) blit(sprite(it, -1), x, y, 1 + 3 * (1 - clamp((t - (it.time - G.preempt)) / G.preempt, 0, 1)), Math.min(1, a * 2));
     }
     if (t >= it.time) {
       const p = sliderPos(it, t), bx = ox + p.x * ps, by = oy + p.y * ps;
-      discAt(bx, by, r * 0.85, colour(it), 1);
-      if (it.following) { g.lineWidth = Math.max(2, r * 0.1); g.strokeStyle = 'rgba(255,255,255,.85)'; g.beginPath(); g.arc(bx, by, r * 2.4, 0, TAU); g.stroke(); }
-      else { g.lineWidth = 2; g.strokeStyle = 'rgba(255,255,255,.35)'; g.beginPath(); g.arc(bx, by, r, 0, TAU); g.stroke(); }
+      it.fs = (it.fs || 1) + ((it.following ? 2.4 : 1) - (it.fs || 1)) * Math.min(1, G.dt / 90);
+      blit(sprite(it, 0), bx, by, 0.95, 1);
+      g.globalAlpha = it.following ? 0.9 : 0.4; g.lineWidth = Math.max(2, R * 0.1); g.strokeStyle = '#fff';
+      g.beginPath(); g.arc(bx, by, R * it.fs, 0, TAU); g.stroke();
+      if (it.following) { g.globalAlpha = 0.12; g.fillStyle = '#fff'; g.fill(); }
+      g.globalAlpha = 1;
     }
   }
 
   function drawSpinner(it, t, a) {
     const cx = ox + 256 * ps, cy = oy + 192 * ps, R = 150 * ps;
+    const prog = clamp(it.rot / it.required, 0, 1);
     g.globalAlpha = a * 0.9; g.lineWidth = 6; g.strokeStyle = '#4a4180';
     g.beginPath(); g.arc(cx, cy, R, 0, TAU); g.stroke();
-    const prog = clamp(it.rot / it.required, 0, 1);
     g.strokeStyle = it.cleared ? '#7fff7f' : '#ff66aa'; g.lineWidth = 10;
     g.beginPath(); g.arc(cx, cy, R, -Math.PI / 2, -Math.PI / 2 + prog * TAU); g.stroke();
-    g.fillStyle = '#fff'; g.font = `bold ${Math.round(28 * ps)}px system-ui,sans-serif`; g.textAlign = 'center'; g.textBaseline = 'middle';
+    // shrinking approach ring
+    const k = t < it.time ? 1 : clamp(1 - (t - it.time) / (it.endTime - it.time), 0, 1);
+    g.strokeStyle = '#fff'; g.lineWidth = 3; g.globalAlpha = a * 0.7;
+    g.beginPath(); g.arc(cx, cy, R * (0.15 + 0.85 * k), 0, TAU); g.stroke();
+    if (it.prevA !== null) {
+      g.globalAlpha = 1; g.fillStyle = '#fff';
+      g.beginPath(); g.arc(cx + Math.cos(it.prevA) * R * 0.6, cy + Math.sin(it.prevA) * R * 0.6, 9 * ps * 0.8, 0, TAU); g.fill();
+    }
+    g.globalAlpha = 1; g.fillStyle = '#fff'; g.font = `bold ${Math.round(28 * ps)}px system-ui,sans-serif`; g.textAlign = 'center'; g.textBaseline = 'middle';
     g.fillText(t < it.time ? 'SPIN!' : it.cleared ? 'CLEAR' : `${Math.round(prog * 100)}%`, cx, cy);
-    if (t < it.time) { const k = 1 + 2 * clamp((it.time - t) / G.preempt, 0, 1); g.strokeStyle = '#fff'; g.lineWidth = 2; g.beginPath(); g.arc(cx, cy, R * 0.3 * k, 0, TAU); g.stroke(); }
-    g.globalAlpha = 1;
   }
 
   /* taiko */
@@ -614,7 +795,7 @@
       }
     }
     // judgement pops
-    G.pops = G.pops.filter(p => t - p.t < 450);
+    prune(G.pops, t, 450);
     g.font = `bold ${Math.round(R * 0.6)}px system-ui,sans-serif`; g.textAlign = 'center'; g.textBaseline = 'middle';
     for (const p of G.pops) {
       g.globalAlpha = 1 - (t - p.t) / 450;
@@ -636,6 +817,7 @@
     // health
     g.fillStyle = '#2a2450'; g.fillRect(16, 14, Math.min(360, W * 0.4), 12);
     g.fillStyle = s.health > 0.3 ? '#7fff7f' : '#ff5c5c'; g.fillRect(16, 14, Math.min(360, W * 0.4) * s.health, 12);
+    if (settings.fps) { g.fillStyle = '#9a92c0'; g.font = '12px system-ui,sans-serif'; g.textAlign = 'right'; g.textBaseline = 'top'; g.fillText(Math.round(G.fps) + ' fps', W - 16, 70); }
     // progress
     const prog = clamp((t - G.map.firstTime) / Math.max(1, G.map.lastTime - G.map.firstTime), 0, 1);
     g.fillStyle = '#ff66aa'; g.fillRect(0, H - 4, W * prog, 4);
