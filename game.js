@@ -12,7 +12,7 @@
   const DEFAULT_COLOURS = ['#ff9bd0', '#7fd1ff', '#a5ff8c', '#ffd27a'];
 
   /* ---------------- settings ---------------- */
-  const settings = { vol: 60, offset: 0, scale: 1, noFail: true, autoplay: false, fps: false, bg: false, lock: false, fx: false, hw: true };
+  const settings = { vol: 60, offset: 0, scale: 1, noFail: true, autoplay: false, fps: false, bg: false, lock: false, fx: false, hw: true, bursts: true };
   try { Object.assign(settings, JSON.parse(localStorage.getItem('ozu-settings') || '{}')); } catch (e) { /* ignore */ }
   function setCursorClass() { document.body.classList.toggle('hw', settings.hw); }
   function saveSettings() { try { localStorage.setItem('ozu-settings', JSON.stringify(settings)); } catch (e) { /* ignore */ } }
@@ -24,7 +24,7 @@
   $('scale').onchange = e => { settings.scale = +e.target.value; resize(); saveSettings(); };
   $('noFail').onchange = e => { settings.noFail = e.target.checked; saveSettings(); };
   $('autoplay').onchange = e => { settings.autoplay = e.target.checked; saveSettings(); };
-  for (const k of ['fps', 'bg', 'lock', 'fx', 'hw']) { $(k).checked = settings[k]; $(k).onchange = e => { settings[k] = e.target.checked; saveSettings(); if (k === 'hw') setCursorClass(); if (G) for (const it of G.items) it.bodyC = undefined; }; }
+  for (const k of ['fps', 'bg', 'lock', 'fx', 'hw', 'bursts']) { $(k).checked = settings[k]; $(k).onchange = e => { settings[k] = e.target.checked; saveSettings(); if (k === 'hw') setCursorClass(); if (G) for (const it of G.items) it.bodyC = undefined; }; }
 
   /* ---------------- audio ---------------- */
   let ac = null, gain = null, srcNode = null;
@@ -295,7 +295,7 @@
       s.combo++; if (s.combo > s.maxCombo) s.maxCombo = s.combo;
       setHealth(grade === 300 ? 0.035 : grade === 100 ? 0.02 : 0.006);
     } else { s.combo = 0; setHealth(-(0.04 + 0.008 * G.map.diff.hp)); }
-    if (G.mode === 1 || settings.fx) G.pops.push({ t: nowT(), x, y, grade });
+    if (G.mode === 1 || (settings.bursts && grade < 300)) G.pops.push({ t: nowT(), x, y, grade });
   }
   function fxPush(e) { if (settings.fx) G.effects.push(e); }
   function partHit(it, pts, x, y) { addScore(pts); G.stats.combo++; G.stats.maxCombo = Math.max(G.stats.maxCombo, G.stats.combo); G.stats.score += 0; it.partsHit++; setHealth(0.008); fxPush({ t: nowT(), x, y, k: 'ring' }); }
@@ -410,7 +410,7 @@
       const grade = ratio >= 0.999 ? 300 : ratio >= 0.5 ? 100 : ratio > 0 ? 50 : 0;
       const s = G.stats; s.judged++;
       if (grade === 300) s.n300++; else if (grade === 100) s.n100++; else if (grade === 50) s.n50++; else s.nMiss++;
-      if (settings.fx) G.pops.push({ t, x: it.endX, y: it.endY, grade });
+      if (settings.bursts && grade < 300) G.pops.push({ t, x: it.endX, y: it.endY, grade });
       setHealth(grade === 300 ? 0.035 : grade ? 0.015 : -0.05);
       it.done = true; it.bodyC = null;
       fxPush({ t, x: it.endX, y: it.endY, k: 'ring' });
@@ -670,18 +670,49 @@
       else { g.globalAlpha = 1 - f; g.strokeStyle = '#fff'; g.lineWidth = 3; g.beginPath(); g.arc(x, y, R * (0.4 + f * 0.8), 0, TAU); g.stroke(); }
     }
     g.globalAlpha = 1;
-    prune(G.pops, t, 500);
-    g.font = `bold ${Math.round(16 * ps)}px system-ui,sans-serif`; g.textAlign = 'center'; g.textBaseline = 'middle';
-    for (const p of G.pops) {
-      if (p.grade === 300) continue;
-      const f = (t - p.t) / 500;
-      g.globalAlpha = 1 - f;
-      g.fillStyle = p.grade === 100 ? '#7fff7f' : p.grade === 50 ? '#ffd27a' : '#ff5c5c';
-      g.fillText(p.grade > 0 ? String(p.grade) : '✕', ox + p.x * ps, oy + (p.y - 20) * ps - f * 10);
-    }
-    g.globalAlpha = 1;
+    renderBursts(t);
     renderErrorBar(t);
     renderCursor();
+  }
+
+  /* osu!-style hit bursts: 100 (green), 50 (yellow), miss (red X). Pre-rendered, a single blit each. */
+  const BURST = { 100: ['100', '#8ff08a'], 50: ['50', '#ffc94d'], 0: ['✕', '#ff4d4d'] };
+  function burstSprite(grade) {
+    const key = 'b' + grade;
+    let sp = sprites.get(key);
+    if (sp) return sp;
+    const [label, col] = BURST[grade], k = canvas.width / W, px = Math.max(18, Math.round(G.radius * ps * (grade ? 0.62 : 0.9)));
+    const w = Math.ceil(px * (grade ? 2.4 : 1.6)), h = Math.ceil(px * 1.7);
+    const c = document.createElement('canvas'); c.width = Math.ceil(w * k); c.height = Math.ceil(h * k);
+    const x = c.getContext('2d'); x.scale(k, k);
+    x.font = `800 ${px}px system-ui,"Segoe UI",sans-serif`; x.textAlign = 'center'; x.textBaseline = 'middle';
+    x.lineJoin = 'round'; x.lineWidth = Math.max(3, px * 0.16); x.strokeStyle = 'rgba(0,0,0,.65)'; x.strokeText(label, w / 2, h / 2);
+    x.fillStyle = col; x.fillText(label, w / 2, h / 2);
+    sp = { c, d: w, h }; sprites.set(key, sp);
+    return sp;
+  }
+  function renderBursts(t) {
+    const pops = G.pops;
+    if (!pops.length) return;
+    prune(pops, t, 650);
+    for (const p of pops) {
+      if (p.grade === 300) continue;
+      const f = (t - p.t) / 650, sp = burstSprite(p.grade);
+      let x = ox + p.x * ps, y = oy + p.y * ps, sc, a, rot = 0;
+      if (p.grade > 0) {                                  // quick pop-in, short hold, fade
+        sc = f < 0.12 ? 0.6 + 0.55 * (f / 0.12) : 1.15 - 0.15 * Math.min(1, (f - 0.12) / 0.2);
+        a = f < 0.55 ? 1 : 1 - (f - 0.55) / 0.45;
+      } else {                                            // miss: drops and tilts
+        sc = f < 0.1 ? 1.3 - 0.3 * (f / 0.1) : 1;
+        a = f < 0.5 ? 1 : 1 - (f - 0.5) / 0.5;
+        y += f * f * G.radius * ps * 1.2; rot = (p.rot || (p.rot = (Math.random() - 0.5) * 0.5)) * f * 2;
+      }
+      g.globalAlpha = a;
+      g.save(); g.translate(x, y); if (rot) g.rotate(rot); g.scale(sc, sc);
+      g.drawImage(sp.c, -sp.d / 2, -sp.h / 2, sp.d, sp.h);
+      g.restore();
+    }
+    g.globalAlpha = 1;
   }
 
   function renderErrorBar(t) {
